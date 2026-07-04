@@ -1,103 +1,80 @@
-﻿import streamlit as st
-import anthropic
-import json
 import io
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import anthropic
+import pandas as pd
+import streamlit as st
 
+from utils import (MODEL, extract_json, extract_text, friendly_error,
+                   get_api_key, paste_or_upload)
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    from pypdf import PdfReader
-    reader = PdfReader(io.BytesIO(file_bytes))
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
-
-
-def extract_text_from_docx(file_bytes: bytes) -> str:
-    from docx import Document
-    doc = Document(io.BytesIO(file_bytes))
-    return "\n".join(p.text for p in doc.paragraphs)
-
-
-def extract_text(uploaded_file) -> str:
-    data = uploaded_file.read()
-    name = uploaded_file.name.lower()
-    if name.endswith(".pdf"):
-        return extract_text_from_pdf(data)
-    if name.endswith(".docx"):
-        return extract_text_from_docx(data)
-    return data.decode("utf-8", errors="ignore")
-
-
-SCREEN_PROMPT = """You are an expert technical recruitment consultant with 10+ years of experience placing engineers and tech professionals. Evaluate each candidate against the job description provided.
+SCREEN_PROMPT = """You are an expert technical recruitment consultant with 10+ years of experience placing engineers and tech professionals. Evaluate this ONE candidate against the job description provided.
 
 JOB DESCRIPTION:
 {jd}
 
-CANDIDATES:
-{candidates}
+CANDIDATE CV (file: {filename}):
+{cv}
 
-Assess each candidate and return a JSON array. One object per candidate, in this exact format:
-[
-  {{
-    "name": "Full name extracted from CV, or filename if not found",
-    "score": <integer 1-10, where 10 is a perfect match>,
-    "tier": "Strong Yes | Yes | Maybe | No",
-    "strengths": ["specific strength 1", "specific strength 2", "specific strength 3"],
-    "gaps": ["specific gap 1", "specific gap 2"],
-    "years_experience": <integer, estimated total relevant experience>,
-    "current_role": "their current or most recent job title",
-    "recommendation": "One punchy sentence on whether to progress them and why."
-  }}
-]
+Assess the candidate and return a single JSON object in this exact format:
+{{
+  "name": "Full name extracted from CV, or the filename if not found",
+  "score": <integer 1-10, where 10 is a perfect match>,
+  "tier": "Strong Yes | Yes | Maybe | No",
+  "strengths": ["specific strength 1", "specific strength 2", "specific strength 3"],
+  "gaps": ["specific gap 1", "specific gap 2"],
+  "years_experience": <integer, estimated total relevant experience>,
+  "current_role": "their current or most recent job title",
+  "recommendation": "One punchy sentence on whether to progress them and why."
+}}
 
 Scoring guide:
-- 9-10: Exceptional match, tick every box, would excite any client
+- 9-10: Exceptional match, ticks every box, would excite any client
 - 7-8: Strong match, minor gaps that are trainable
 - 5-6: Partial match, worth a conversation
 - 3-4: Significant gaps but some relevant experience
 - 1-2: Poor fit
 
-Be direct and specific â€” vague feedback is useless. Focus on technical skills, experience level, and role fit.
-Return ONLY the JSON array. No preamble, no explanation, no markdown code fences."""
+Be direct and specific - vague feedback is useless. Focus on technical skills, experience level, and role fit. Consider the candidate's FULL career history, not just their current role.
+Return ONLY the JSON object. No preamble, no explanation, no markdown code fences."""
+
+TIER_ICON = {"Strong Yes": "🟢", "Yes": "🟡", "Maybe": "🟠", "No": "🔴"}
 
 
-def screen_candidates(jd: str, candidates: list[tuple[str, str]], api_key: str) -> list[dict]:
-    client = anthropic.Anthropic(api_key=api_key)
-
-    candidate_sections = ""
-    for i, (name, text) in enumerate(candidates):
-        # Truncate very long CVs to keep prompt manageable
-        truncated = text[:4000] if len(text) > 4000 else text
-        candidate_sections += f"\n\n--- CANDIDATE {i + 1}: {name} ---\n{truncated}"
-
-    prompt = SCREEN_PROMPT.format(jd=jd[:3000], candidates=candidate_sections)
-
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        messages=[{"role": "user", "content": prompt}]
+def screen_one(client: anthropic.Anthropic, jd: str, filename: str, cv_text: str) -> dict:
+    prompt = SCREEN_PROMPT.format(jd=jd[:10000], filename=filename, cv=cv_text[:30000])
+    resp = client.messages.create(
+        model=MODEL,
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}],
     )
-
-    raw = message.content[0].text.strip()
-    # Strip markdown fences if model adds them despite instructions
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw)
+    raw = "".join(b.text for b in resp.content if b.type == "text")
+    result = extract_json(raw)
+    result["file"] = filename
+    return result
 
 
-# â”€â”€ UI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def results_dataframe(results: list[dict]) -> pd.DataFrame:
+    return pd.DataFrame([{
+        "Name": r.get("name", "Unknown"),
+        "Score": r.get("score", ""),
+        "Tier": r.get("tier", ""),
+        "Current Role": r.get("current_role", ""),
+        "Years Exp": r.get("years_experience", ""),
+        "Strengths": "; ".join(r.get("strengths", [])),
+        "Gaps": "; ".join(r.get("gaps", [])),
+        "Recommendation": r.get("recommendation", ""),
+        "File": r.get("file", ""),
+    } for r in results])
 
-st.title("CV Screener")
-st.markdown("Paste a job description, upload candidate CVs, and get a ranked shortlist in seconds.")
 
-# Pull API key from session state (set on home page)
-api_key = st.session_state.get("api_key", "")
-if not api_key:
-    api_key = st.text_input("Anthropic API Key", type="password",
-                             help="Or set it on the Home page to persist across tools")
-    if api_key:
-        st.session_state.api_key = api_key
+# ── UI ────────────────────────────────────────────────────────────────────────
+
+st.title("📋 CV Screener")
+st.markdown("Paste a job description, upload candidate CVs, and get a ranked, exportable shortlist. "
+            "Each CV is screened individually so long CVs are read in full.")
+
+api_key = get_api_key()
 
 st.divider()
 
@@ -105,10 +82,12 @@ col_jd, col_cv = st.columns([1, 1])
 
 with col_jd:
     st.subheader("Job Description")
-    jd = st.text_area(
-        "Paste the full JD here",
+    jd = paste_or_upload(
+        "Job description",
+        key="cvs_jd",
         height=350,
-        placeholder="Include: role title, required skills, years of experience, responsibilities..."
+        placeholder="Include: role title, required skills, years of experience, responsibilities...",
+        upload_hint="Drop the client's JD as a PDF, Word, or text file",
     )
 
 with col_cv:
@@ -117,7 +96,7 @@ with col_cv:
         "Upload one or more CVs",
         accept_multiple_files=True,
         type=["pdf", "docx", "txt"],
-        help="PDF and DOCX are best. Upload as many as you like."
+        help="PDF and DOCX are best. Each CV is screened in its own request, in parallel."
     )
     if uploaded_files:
         st.caption(f"{len(uploaded_files)} file(s) ready to screen")
@@ -128,80 +107,103 @@ run = st.button("Screen Candidates", type="primary", use_container_width=True)
 
 if run:
     if not api_key:
-        st.error("Add your Anthropic API key above or on the Home page.")
+        st.error("Add your Anthropic API key in the sidebar first.")
         st.stop()
     if not jd.strip():
-        st.error("Paste the job description before screening.")
+        st.error("Add the job description first - drop a file or paste it.")
         st.stop()
     if not uploaded_files:
         st.error("Upload at least one CV.")
         st.stop()
 
-    # Extract text
-    candidates = []
     progress = st.progress(0, text="Reading CVs...")
+    candidates = []
     for i, f in enumerate(uploaded_files):
-        text = extract_text(f)
-        candidates.append((f.name, text))
-        progress.progress((i + 1) / len(uploaded_files), text=f"Read: {f.name}")
+        candidates.append((f.name, extract_text(f)))
+        progress.progress((i + 1) / (len(uploaded_files) * 2), text=f"Read: {f.name}")
 
-    progress.progress(100, text="Sending to Claude...")
-
-    try:
-        results = screen_candidates(jd, candidates, api_key)
-    except json.JSONDecodeError as e:
-        st.error(f"Claude returned unexpected output. Try again. ({e})")
-        st.stop()
-    except anthropic.AuthenticationError:
-        st.error("Invalid API key. Check it and try again.")
-        st.stop()
+    client = anthropic.Anthropic(api_key=api_key)
+    results, errors = [], []
+    total = len(candidates)
+    done = 0
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(screen_one, client, jd, name, text): name
+            for name, text in candidates
+        }
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                results.append(fut.result())
+            except Exception as e:
+                errors.append((name, friendly_error(e)))
+            done += 1
+            progress.progress(0.5 + done / (total * 2), text=f"Screened {done}/{total}")
 
     progress.empty()
-
     results.sort(key=lambda x: x.get("score", 0), reverse=True)
+    st.session_state.cv_results = {"jd": jd, "results": results, "errors": errors}
 
-    tier_icon = {"Strong Yes": "ðŸŸ¢", "Yes": "ðŸŸ¡", "Maybe": "ðŸŸ ", "No": "ðŸ”´"}
+# ── Results (persist across reruns so clicking around doesn't lose them) ─────
 
-    st.subheader(f"Results â€” {len(results)} candidate(s) screened")
+state = st.session_state.get("cv_results")
+if state:
+    results = state["results"]
+    errors = state["errors"]
 
-    # Summary table
-    table_data = []
-    for r in results:
-        icon = tier_icon.get(r.get("tier", ""), "âšª")
-        table_data.append({
-            "": icon,
+    for name, msg in errors:
+        st.warning(f"Could not screen **{name}**: {msg}")
+
+    if results:
+        st.subheader(f"Results — {len(results)} candidate(s) screened")
+
+        table_data = [{
+            "": TIER_ICON.get(r.get("tier", ""), "⚪"),
             "Name": r.get("name", "Unknown"),
             "Score": f"{r.get('score', '?')}/10",
-            "Tier": r.get("tier", "â€”"),
-            "Current Role": r.get("current_role", "â€”"),
-            "Exp (yrs)": r.get("years_experience", "â€”"),
-        })
+            "Tier": r.get("tier", "—"),
+            "Current Role": r.get("current_role", "—"),
+            "Exp (yrs)": r.get("years_experience", "—"),
+        } for r in results]
+        st.dataframe(table_data, use_container_width=True, hide_index=True)
 
-    st.dataframe(table_data, use_container_width=True, hide_index=True)
+        # Exports
+        df = results_dataframe(results)
+        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+        xlsx_buf = io.BytesIO()
+        with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+            df.to_excel(writer, index=False, sheet_name="Shortlist")
+        xlsx_buf.seek(0)
 
-    st.divider()
-    st.subheader("Detailed Assessments")
+        dl1, dl2, _ = st.columns([1, 1, 2])
+        with dl1:
+            st.download_button("⬇️ Download Excel (.xlsx)", data=xlsx_buf.getvalue(),
+                               file_name="cv_screening_shortlist.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               use_container_width=True, type="primary")
+        with dl2:
+            st.download_button("⬇️ Download CSV", data=csv_bytes,
+                               file_name="cv_screening_shortlist.csv",
+                               mime="text/csv", use_container_width=True)
 
-    for r in results:
-        icon = tier_icon.get(r.get("tier", ""), "âšª")
-        score = r.get("score", "?")
-        name = r.get("name", "Unknown")
-        tier = r.get("tier", "â€”")
+        st.divider()
+        st.subheader("Detailed Assessments")
 
-        with st.expander(f"{icon} {name} â€” {score}/10 | {tier}"):
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**Strengths**")
-                for s in r.get("strengths", []):
-                    st.markdown(f"âœ“ {s}")
-            with c2:
-                st.markdown("**Gaps**")
-                gaps = r.get("gaps", [])
-                if gaps:
-                    for g in gaps:
-                        st.markdown(f"âœ— {g}")
-                else:
-                    st.markdown("None identified")
-
-            st.markdown(f"**Recommendation:** {r.get('recommendation', 'â€”')}")
-
+        for r in results:
+            icon = TIER_ICON.get(r.get("tier", ""), "⚪")
+            label = f"{icon} {r.get('name', 'Unknown')} — {r.get('score', '?')}/10 | {r.get('tier', '—')}"
+            with st.expander(label):
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**Strengths**")
+                    for s in r.get("strengths", []):
+                        st.markdown(f"✓ {s}")
+                with c2:
+                    st.markdown("**Gaps**")
+                    gaps = r.get("gaps", [])
+                    if gaps:
+                        for g in gaps:
+                            st.markdown(f"✗ {g}")
+                    else:
+                        st.markdown("None identified")
+                st.markdown(f"**Recommendation:** {r.get('recommendation', '—')}")

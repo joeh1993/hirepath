@@ -1,9 +1,10 @@
-import streamlit as st
-import anthropic
-import json
 import io
-import re
+import json
 
+import streamlit as st
+
+from utils import (WEB_SEARCH_TOOL, extract_json, friendly_error, generate,
+                   get_api_key)
 
 # ── Prompt ───────────────────────────────────────────────────────────────────
 
@@ -17,7 +18,11 @@ COMPANY SIZE PREFERENCE: {sizes}
 PURPOSE: {purpose}
 ADDITIONAL CONTEXT: {context}
 
----
+You have web search available. USE IT to ground this map in reality:
+- Search for companies in {location} currently advertising {role_type} roles (LinkedIn, SEEK, careers pages)
+- Search for recent news that creates hiring demand: funding rounds, breaches, compliance deadlines, new security leaders
+- Verify that companies you name actually have a presence in {location}
+Only put a company in Tier 1 if you found a live, current signal for it. If a company is included on inference alone, say so in its "signal" field (e.g. "Inferred - no live signal found, verify before calling").
 
 Return a JSON object in EXACTLY this format. No preamble, no explanation, no markdown fences.
 
@@ -38,33 +43,11 @@ Return a JSON object in EXACTLY this format. No preamble, no explanation, no mar
       "team_size": "Estimated security team size e.g. 5-10",
       "who_to_target": "Job title(s) of the hiring decision maker",
       "bd_angle": "One sentence on the best way to approach this company",
-      "signal": "Any known signal that makes them a strong target right now"
+      "signal": "The live signal you found (job ad, funding, breach, hire) with rough date - or 'Inferred' if none"
     }}
   ],
-  "tier_2": [
-    {{
-      "company": "Company name",
-      "sector": "e.g. Technology",
-      "size": "e.g. 100-500 employees",
-      "why_they_hire": "Why they hire this role.",
-      "team_size": "Estimated team size",
-      "who_to_target": "Decision maker title(s)",
-      "bd_angle": "Best approach angle",
-      "signal": "Why they are a target"
-    }}
-  ],
-  "tier_3": [
-    {{
-      "company": "Company name",
-      "sector": "e.g. Healthcare",
-      "size": "e.g. 50-200 employees",
-      "why_they_hire": "Why they hire this role.",
-      "team_size": "Estimated team size",
-      "who_to_target": "Decision maker title(s)",
-      "bd_angle": "Best approach angle",
-      "signal": "Why they are worth watching"
-    }}
-  ],
+  "tier_2": [ (same object shape) ],
+  "tier_3": [ (same object shape) ],
   "candidate_sourcing_tips": [
     "Tip 1 for finding candidates of this type in this market",
     "Tip 2",
@@ -73,42 +56,14 @@ Return a JSON object in EXACTLY this format. No preamble, no explanation, no mar
 }}
 
 RULES:
-- Tier 1: 6-8 companies. Highest priority. Active or very likely hiring. Strong BD opportunity.
-- Tier 2: 8-10 companies. Good prospects. Likely hiring in near future or ongoing need.
+- Tier 1: 6-8 companies. Highest priority. Live hiring signal found via search.
+- Tier 2: 8-10 companies. Good prospects. Likely hiring soon or ongoing need.
 - Tier 3: 5-7 companies. Longer-term targets. Worth monitoring or a lighter touch.
-- Use real Australian companies you know. If you name a company, make sure the details are accurate to your knowledge.
+- Use real Australian companies. Make sure the details are accurate to what you found or know.
 - Be specific to {location} and the Australian market. Do not give generic global companies unless they have a significant {location} presence.
 - Tailor everything to the role type and seniority provided.
 - Do not use em dashes. Do not use the word "genuinely".
 - Return ONLY the JSON object."""
-
-
-def generate_market_map(role_type, seniority, location, verticals, sizes, purpose, context, api_key):
-    client = anthropic.Anthropic(api_key=api_key)
-
-    prompt = MARKET_MAP_PROMPT.format(
-        role_type=role_type,
-        seniority=seniority,
-        location=location,
-        verticals=", ".join(verticals) if verticals else "All sectors",
-        sizes=", ".join(sizes) if sizes else "All sizes",
-        purpose=purpose,
-        context=context or "No additional context provided.",
-    )
-
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=6000,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    raw = message.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.rsplit("```", 1)[0]
-    return json.loads(raw.strip())
 
 
 # ── DOCX export ───────────────────────────────────────────────────────────────
@@ -151,7 +106,6 @@ def build_docx(data: dict, role_type: str, seniority: str, location: str) -> byt
         section.left_margin   = Cm(2)
         section.right_margin  = Cm(2)
 
-    # Title
     title_p = doc.add_paragraph()
     title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     tr = title_p.add_run("Market Map")
@@ -165,11 +119,9 @@ def build_docx(data: dict, role_type: str, seniority: str, location: str) -> byt
 
     doc.add_paragraph()
 
-    # Summary
     doc.add_heading("Market Overview", level=1).runs[0].font.color.rgb = RGBColor(0x1A, 0x56, 0xDB)
     doc.add_paragraph(data.get("summary", ""))
 
-    # Market insights
     if data.get("market_insights"):
         doc.add_heading("Key Market Insights", level=2)
         for insight in data["market_insights"]:
@@ -178,7 +130,6 @@ def build_docx(data: dict, role_type: str, seniority: str, location: str) -> byt
 
     doc.add_paragraph()
 
-    # Tier tables
     tier_config = [
         ("tier_1", "Tier 1 Targets",  "1A56DB", "DBEAFE"),
         ("tier_2", "Tier 2 Targets",  "065F46", "D1FAE5"),
@@ -200,12 +151,10 @@ def build_docx(data: dict, role_type: str, seniority: str, location: str) -> byt
         table = doc.add_table(rows=1, cols=len(col_headers))
         table.style = "Table Grid"
 
-        # Set column widths
         for i, width in enumerate(col_widths_cm):
             for cell in table.columns[i].cells:
                 cell.width = Cm(width)
 
-        # Header row
         hdr_row = table.rows[0]
         for i, header in enumerate(col_headers):
             cell = hdr_row.cells[i]
@@ -217,7 +166,6 @@ def build_docx(data: dict, role_type: str, seniority: str, location: str) -> byt
                     run.font.size = Pt(9)
                     run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
 
-        # Data rows
         for idx, company in enumerate(companies):
             row_data = [
                 company.get("company", ""),
@@ -234,7 +182,6 @@ def build_docx(data: dict, role_type: str, seniority: str, location: str) -> byt
 
         doc.add_paragraph()
 
-    # Candidate sourcing tips
     if data.get("candidate_sourcing_tips"):
         doc.add_heading("Candidate Sourcing Tips", level=1).runs[0].font.color.rgb = RGBColor(0x1A, 0x56, 0xDB)
         for tip in data["candidate_sourcing_tips"]:
@@ -250,18 +197,12 @@ def build_docx(data: dict, role_type: str, seniority: str, location: str) -> byt
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 st.title("🗺️ Market Map Builder")
-st.markdown("Identify and prioritise target companies for a specific role type, ranked by hiring likelihood and BD opportunity.")
+st.markdown("Identify and prioritise target companies for a specific role type - grounded in "
+            "**live web search** for current job ads and hiring signals.")
 
-api_key = st.session_state.get("api_key", "")
-if not api_key:
-    api_key = st.text_input("Anthropic API Key", type="password",
-                             help="Or set it on the Home page to persist across tools")
-    if api_key:
-        st.session_state.api_key = api_key
+api_key = get_api_key()
 
 st.divider()
-
-# ── Inputs ────────────────────────────────────────────────────────────────────
 
 col_left, col_right = st.columns([1, 1])
 
@@ -291,7 +232,8 @@ with col_left:
 
     seniority = st.selectbox(
         "Seniority level",
-        options=["Junior (0-2 yrs)", "Mid-level (2-5 yrs)", "Senior (5-8 yrs)", "Lead / Manager (8+ yrs)", "Executive / CISO"]
+        options=["Junior (0-2 yrs)", "Mid-level (2-5 yrs)", "Senior (5-8 yrs)",
+                 "Lead / Manager (8+ yrs)", "Executive / CISO"]
     )
 
     location = st.selectbox(
@@ -303,11 +245,10 @@ with col_left:
     purpose = st.radio(
         "What are you mapping for?",
         options=[
-            "BD targeting — companies to call for a new brief",
-            "Candidate sourcing — companies where this talent sits",
+            "BD targeting - companies to call for a new brief",
+            "Candidate sourcing - companies where this talent sits",
             "Both BD and candidate sourcing",
         ],
-        horizontal=False,
     )
 
 with col_right:
@@ -345,47 +286,56 @@ with col_right:
     context = st.text_area(
         "Anything else to factor in? (optional)",
         height=120,
-        placeholder="e.g. Client has asked us not to approach CBA or Westpac. Focus on companies that are currently advertising security roles. Prefer companies with recent cyber incidents or compliance drivers like APRA CPS 234."
+        placeholder="e.g. Client has asked us not to approach CBA or Westpac. Focus on companies with recent cyber incidents or compliance drivers like APRA CPS 234."
     )
 
 st.divider()
 run = st.button("Build Market Map", type="primary", use_container_width=True)
 
-# ── Run ───────────────────────────────────────────────────────────────────────
-
 if run:
     if not api_key:
-        st.error("Add your Anthropic API key above or on the Home page.")
+        st.error("Add your Anthropic API key in the sidebar first.")
         st.stop()
 
-    with st.spinner(f"Mapping the {seniority} {role_type} market in {location}... this takes 30-60 seconds"):
+    prompt = MARKET_MAP_PROMPT.format(
+        role_type=role_type,
+        seniority=seniority,
+        location=location,
+        verticals=", ".join(verticals) if verticals else "All sectors",
+        sizes=", ".join(sizes) if sizes else "All sizes",
+        purpose=purpose,
+        context=context or "No additional context provided.",
+    )
+
+    with st.spinner(f"Searching live job ads and mapping the {seniority} {role_type} market "
+                    f"in {location}... this takes 1-2 minutes"):
         try:
-            data = generate_market_map(
-                role_type=role_type,
-                seniority=seniority,
-                location=location,
-                verticals=verticals,
-                sizes=sizes,
-                purpose=purpose,
-                context=context,
-                api_key=api_key,
-            )
-        except json.JSONDecodeError as e:
-            st.error(f"Claude returned unexpected output. Try again. ({e})")
-            st.stop()
-        except anthropic.AuthenticationError:
-            st.error("Invalid API key. Check it and try again.")
+            raw = generate(api_key, prompt, max_tokens=8000, tools=[WEB_SEARCH_TOOL])
+            data = extract_json(raw)
+        except json.JSONDecodeError:
+            st.error("Claude returned output that couldn't be parsed. Try again.")
             st.stop()
         except Exception as e:
-            st.error(f"Something went wrong: {e}")
+            st.error(friendly_error(e))
             st.stop()
 
-    st.success("Market map ready!")
+    st.session_state.market_map = {
+        "data": data, "role_type": role_type, "seniority": seniority, "location": location,
+    }
+
+# ── Results (persist across reruns) ──────────────────────────────────────────
+
+state = st.session_state.get("market_map")
+if state:
+    data = state["data"]
+    role_type = state["role_type"]
+    seniority = state["seniority"]
+    location = state["location"]
+
     st.divider()
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-
     st.subheader(f"{seniority} {role_type} Market — {location}")
+    st.caption("⚠️ Built from live search plus market knowledge. Companies marked "
+               "'Inferred' had no live signal - verify before calling.")
 
     if data.get("summary"):
         st.info(data["summary"])
@@ -396,8 +346,6 @@ if run:
                 st.markdown(f"- {insight}")
 
     st.divider()
-
-    # ── Download buttons ──────────────────────────────────────────────────────
 
     safe_role = role_type.replace("/", "-").replace(" ", "_")
     docx_bytes = build_docx(data, role_type, seniority, location)
@@ -423,33 +371,19 @@ if run:
 
     st.divider()
 
-    # ── Tier tables ───────────────────────────────────────────────────────────
-
     tier_config = [
-        ("tier_1", "🟢 Tier 1 — Priority Targets", "#DCFCE7"),
-        ("tier_2", "🟡 Tier 2 — Good Prospects",   "#FEF9C3"),
-        ("tier_3", "🟠 Tier 3 — Watch List",        "#FEF3C7"),
+        ("tier_1", "🟢 Tier 1 — Priority Targets"),
+        ("tier_2", "🟡 Tier 2 — Good Prospects"),
+        ("tier_3", "🟠 Tier 3 — Watch List"),
     ]
 
-    col_labels = {
-        "company":        "Company",
-        "sector":         "Sector",
-        "size":           "Size",
-        "why_they_hire":  "Why They Hire",
-        "team_size":      "Team Size",
-        "who_to_target":  "Who to Target",
-        "bd_angle":       "BD Angle",
-        "signal":         "Signal / Notes",
-    }
-
-    for tier_key, tier_label, bg_color in tier_config:
+    for tier_key, tier_label in tier_config:
         companies = data.get(tier_key, [])
         if not companies:
             continue
 
         st.subheader(f"{tier_label} ({len(companies)} companies)")
 
-        # Render as cards rather than a wide table for readability
         for company in companies:
             name = company.get("company", "Unknown")
             sector = company.get("sector", "")
@@ -466,7 +400,6 @@ if run:
 
         st.divider()
 
-    # ── Sourcing tips ─────────────────────────────────────────────────────────
     if data.get("candidate_sourcing_tips"):
         with st.expander("💡 Candidate Sourcing Tips", expanded=True):
             for tip in data["candidate_sourcing_tips"]:

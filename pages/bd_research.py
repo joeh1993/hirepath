@@ -1,8 +1,9 @@
-﻿import streamlit as st
-import anthropic
+import streamlit as st
 
+from utils import (WEB_SEARCH_TOOL, friendly_error, generate_streaming,
+                   get_api_key, recruiter_details, scrub)
 
-BD_RESEARCH_PROMPT = """You are a senior technical recruitment consultant preparing a call brief for a business development call. The recruiter needs to sound informed, ask smart questions, and position themselves as a specialist â€” not a generalist agency cold-calling.
+BD_RESEARCH_PROMPT = """You are a senior technical recruitment consultant preparing a call brief for a business development call. The recruiter needs to sound informed, ask smart questions, and position themselves as a specialist - not a generalist agency cold-calling.
 
 COMPANY: {company_name}
 WHAT THE RECRUITER KNOWS: {known_info}
@@ -12,83 +13,54 @@ GOAL OF THE CALL: {call_goal}
 RECRUITER NAME: {recruiter_name}
 RECRUITER COMPANY: {recruiter_company}
 
-Write a structured call brief with the following sections. Be specific and actionable â€” generic advice is useless. Where you have knowledge of this company, use it. Where you don't, reason from what you know about companies of this type, size, and industry.
+You have web search available. USE IT before writing the brief:
+- Search for the company's recent news, funding, leadership changes, and breaches or incidents
+- Search for their current job ads (especially security / technical roles) on LinkedIn, SEEK, or their careers page
+- Verify anything the recruiter told you where possible
+Base the brief on what you actually find. If a search turns up nothing, say so rather than inventing detail. Clearly distinguish verified facts from reasonable inference.
 
----
+Write a structured call brief with the following sections. Be specific and actionable - generic advice is useless.
 
 ## Company Snapshot
-3-4 sentences. What they do, their market position, size/stage if known, anything notable. The recruiter should be able to read this and sound informed in the first 30 seconds of a call.
+3-4 sentences. What they do, their market position, size/stage, anything notable and RECENT. The recruiter should be able to read this and sound informed in the first 30 seconds of a call.
 
 ## Why They Are Worth Calling
-Based on what the recruiter has shared, explain specifically why this company is a good BD target right now. What signals suggest they have hiring needs or pain points your recruiter can solve?
+Based on what the recruiter shared plus what you found, explain specifically why this company is a good BD target right now. Cite the concrete signals (live job ads, funding, incidents, hires).
 
 ## Likely Hiring Challenges
-What specific recruitment pain points does a company like this typically face? Think about: the talent market for their roles, competition for candidates, internal HR capability, typical hiring speed. Be specific to their industry and size, not generic.
+What specific recruitment pain points does a company like this face? Think about: the talent market for their roles, competition for candidates, internal HR capability, typical hiring speed. Be specific to their industry and size, not generic.
 
 ## Conversation Starters
-Give 3 specific openers the recruiter could use in the first 2 minutes. These should reference something real about the company or their industry â€” not "I've been following your growth" or "I work with companies like yours."
+Give 3 specific openers the recruiter could use in the first 2 minutes. These should reference something real and current about the company or their industry - not "I've been following your growth."
 
 ## Smart Questions to Ask
-5 questions that will uncover budget, urgency, process, and decision-making authority â€” while making the recruiter sound like a market specialist, not an order-taker. Mix commercial questions with insight-led ones.
+5 questions that will uncover budget, urgency, process, and decision-making authority - while making the recruiter sound like a market specialist, not an order-taker. Mix commercial questions with insight-led ones.
 
 ## How to Position {recruiter_company}
-Tailor the pitch specifically for this company. What angle works best here â€” speed, niche expertise, candidate network, market knowledge? Give the recruiter 3-4 sentences they could actually say on the call.
+Tailor the pitch specifically for this company. What angle works best here - speed, niche expertise, candidate network, market knowledge? Give the recruiter 3-4 sentences they could actually say on the call.
 
 ## Likely Objections and How to Handle Them
-List 3 likely pushbacks (e.g. "we have a PSL", "we hire direct", "we're not hiring right now") with a short, confident response to each. Not aggressive â€” smart and consultative.
+List 3 likely pushbacks (e.g. "we have a PSL", "we hire direct", "we're not hiring right now") with a short, confident response to each. Not aggressive - smart and consultative.
 
 ## One Thing to Remember
 One specific insight or angle that will make this call stand out from the 10 other recruiters who probably called this week.
 
----
-
 CRITICAL RULES:
-- No em dashes (â€” or --)
-- No word "genuinely"
-- No word "leverage"
+- No em dashes or double hyphens
+- Never use the words "genuinely" or "leverage"
 - No "touch base" or "circle back"
 - Be direct and specific throughout
 - Write for a recruiter who has 5 minutes to read this before a call"""
 
 
-def generate_bd_research(company_name, known_info, niche, persona, call_goal,
-                          recruiter_name, recruiter_company, api_key):
-    client = anthropic.Anthropic(api_key=api_key)
+# ── UI ────────────────────────────────────────────────────────────────────────
 
-    prompt = BD_RESEARCH_PROMPT.format(
-        company_name=company_name,
-        known_info=known_info or "Nothing specific â€” use your knowledge of the company and industry.",
-        niche=niche or "technical / cyber security recruitment",
-        persona=persona or "Hiring Manager",
-        call_goal=call_goal,
-        recruiter_name=recruiter_name or "the recruiter",
-        recruiter_company=recruiter_company or "our firm",
-    )
+st.title("🔍 BD Research & Call Prep")
+st.markdown("A full call brief before any BD conversation - grounded in **live web search**, "
+            "not just the model's memory.")
 
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=3000,
-        messages=[{"role": "user", "content": prompt}]
-    )
-
-    output = message.content[0].text
-    output = output.replace("â€”", "-").replace("--", "-")
-    output = output.replace("genuinely", "clearly")
-    output = output.replace("leverage", "use")
-    return output
-
-
-# â”€â”€ UI â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-st.title("BD Research & Call Prep")
-st.markdown("Get a full call brief before any BD conversation â€” sound informed, ask smart questions, win the meeting.")
-
-api_key = st.session_state.get("api_key", "")
-if not api_key:
-    api_key = st.text_input("Anthropic API Key", type="password",
-                             help="Or set it on the Home page")
-    if api_key:
-        st.session_state.api_key = api_key
+api_key = get_api_key()
+recruiter_name, recruiter_company, niche = recruiter_details()
 
 st.divider()
 
@@ -105,9 +77,10 @@ with col_left:
     known_info = st.text_area(
         "What do you already know about them?",
         height=150,
-        placeholder="e.g. Series B fintech, ~300 employees, been posting security roles on LinkedIn for 2 months with no agency logos. Based in Sydney CBD. Think they have a CISO but no dedicated security team beneath them yet."
+        placeholder="e.g. Series B fintech, ~300 employees, been posting security roles on LinkedIn for 2 months with no agency logos. Based in Sydney CBD."
     )
 
+with col_right:
     st.subheader("The Call")
 
     persona = st.text_input(
@@ -118,7 +91,7 @@ with col_left:
     call_goal = st.selectbox(
         "Goal of this call",
         [
-            "First introduction â€” establish the relationship",
+            "First introduction - establish the relationship",
             "Pitch for a specific open role",
             "Follow up after sending a speculative candidate",
             "Re-engage a lapsed client",
@@ -126,26 +99,14 @@ with col_left:
         ]
     )
 
-with col_right:
-    st.subheader("Your Details")
-
-    recruiter_name = st.text_input("Your name", placeholder="Joel Heywood")
-    recruiter_company = st.text_input("Your company", placeholder="Novus Pathway")
-    niche = st.text_input(
-        "Your niche",
-        placeholder="e.g. Cyber security recruitment across Australia",
-        help="Used to tailor the pitch angle and questions"
-    )
-
-    st.divider()
     st.markdown("##### How this tool works")
     st.markdown("""
 The brief is built from:
+- **Live web search** - recent news, funding, current job ads
 - What you tell it about the company
-- Claude's training knowledge of the company and industry
-- Frameworks for what companies of this type typically face
+- Market knowledge of companies of this type and size
 
-For best results, add as much context as you know in the field above. The more specific you are, the sharper the brief.
+Verified facts and inference are flagged separately in the brief.
 """)
 
 st.divider()
@@ -154,7 +115,7 @@ run = st.button("Generate Call Brief", type="primary", use_container_width=True)
 
 if run:
     if not api_key:
-        st.error("Add your Anthropic API key above or on the Home page.")
+        st.error("Add your Anthropic API key in the sidebar first.")
         st.stop()
     if not company_name.strip():
         st.error("Enter the company name.")
@@ -163,35 +124,50 @@ if run:
         st.error("Specify who you are speaking to.")
         st.stop()
 
-    with st.spinner(f"Researching {company_name} and building your call brief..."):
-        brief = generate_bd_research(
-            company_name, known_info, niche, persona,
-            call_goal, recruiter_name, recruiter_company, api_key
-        )
+    prompt = BD_RESEARCH_PROMPT.format(
+        company_name=company_name,
+        known_info=known_info or "Nothing specific - research them from scratch.",
+        niche=niche or "technical / cyber security recruitment",
+        persona=persona,
+        call_goal=call_goal,
+        recruiter_name=recruiter_name or "the recruiter",
+        recruiter_company=recruiter_company or "our firm",
+    )
 
+    st.caption(f"Researching {company_name} with live web search - this takes 30-90 seconds. "
+               "The brief streams in below as it's written.")
+    placeholder = st.empty()
+    try:
+        brief = generate_streaming(api_key, prompt, placeholder,
+                                   max_tokens=4096, tools=[WEB_SEARCH_TOOL])
+    except Exception as e:
+        st.error(friendly_error(e))
+        st.stop()
+
+    st.session_state.bd_brief = {"company": company_name, "brief": scrub(brief)}
+
+# ── Results (persist across reruns) ──────────────────────────────────────────
+
+state = st.session_state.get("bd_brief")
+if state:
+    brief = state["brief"]
     st.divider()
-    st.subheader(f"Call Brief: {company_name}")
-    st.caption("Read this in the 5 minutes before your call. Key sections are expandable.")
+    st.subheader(f"Call Brief: {state['company']}")
+    st.caption("Read this in the 5 minutes before your call. Key sections are expanded.")
 
-    # Parse and display each section
     sections = brief.split("## ")
     if len(sections) > 1:
         for section in sections[1:]:
             lines = section.strip().split("\n", 1)
             title = lines[0].strip()
             body = lines[1].strip() if len(lines) > 1 else ""
-
-            # Highlight the most important sections
-            expanded = title in ["Conversation Starters", "Smart Questions to Ask", "One Thing to Remember"]
-
+            expanded = any(t in title for t in
+                           ["Conversation Starters", "Smart Questions", "One Thing to Remember"])
             with st.expander(f"**{title}**", expanded=expanded):
                 st.markdown(body)
     else:
-        # Fallback: just show the raw output
         st.markdown(brief)
 
     st.divider()
     with st.expander("Full brief (copy all)"):
-        st.text_area("", value=brief, height=400, label_visibility="collapsed")
-        st.caption("Select all (Ctrl+A) to copy the full brief.")
-
+        st.code(brief, language=None, wrap_lines=True)

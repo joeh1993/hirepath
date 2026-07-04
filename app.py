@@ -1,10 +1,29 @@
 import streamlit as st
-from pathlib import Path
 
 st.set_page_config(
     page_title="HirePath",
     page_icon="🛤️",
     layout="wide"
+)
+
+# ── Session bootstrap (app.py runs before every page, so this covers deep links)
+
+
+def _secret(name: str, default: str = "") -> str:
+    try:
+        return st.secrets.get(name, default)
+    except Exception:
+        return default
+
+
+if "api_key" not in st.session_state:
+    st.session_state.api_key = _secret("ANTHROPIC_API_KEY")
+
+st.session_state.setdefault("recruiter_name", _secret("RECRUITER_NAME", "Joel Heywood"))
+st.session_state.setdefault("recruiter_company", _secret("RECRUITER_COMPANY", "Novus Pathway"))
+st.session_state.setdefault(
+    "recruiter_niche",
+    _secret("RECRUITER_NICHE", "Cyber security recruitment across Australia"),
 )
 
 # ── Sidebar logo (shown on every page) ───────────────────────────────────────
@@ -30,6 +49,25 @@ st.sidebar.markdown(_LOGO_COMPACT, unsafe_allow_html=True)
 st.sidebar.markdown("<hr style='margin: 6px 0 10px 0; border-color: #E5E7EB;'>",
                     unsafe_allow_html=True)
 
+# ── Sidebar: recruiter profile (set once, used by every tool) ─────────────────
+
+with st.sidebar.expander("👤 Your details"):
+    st.text_input("Name", key="recruiter_name")
+    st.text_input("Company", key="recruiter_company")
+    st.text_input("Niche", key="recruiter_niche",
+                  help="Used to establish credibility in outreach and briefs")
+
+if not st.session_state.api_key:
+    entered = st.sidebar.text_input(
+        "Anthropic API key", type="password",
+        help="Stored in session only — never saved to disk. Get yours at console.anthropic.com",
+    )
+    if entered:
+        st.session_state.api_key = entered
+        st.rerun()
+else:
+    st.sidebar.caption("API key loaded ✓")
+
 # ── Pages ────────────────────────────────────────────────────────────────────
 
 home        = st.Page("pages/home.py",               title="Home",                    icon="🏠", default=True)
@@ -42,6 +80,7 @@ cv_screener     = st.Page("pages/cv_screener.py",       title="CV Screener",    
 cand_outreach   = st.Page("pages/candidate_outreach.py",title="Candidate Outreach",      icon="✉️")
 cand_profile    = st.Page("pages/candidate_profile.py", title="Candidate Profile Writer",icon="📝")
 jd_optimizer    = st.Page("pages/jd_optimizer.py",      title="JD Optimizer",            icon="📄")
+boolean_builder = st.Page("pages/boolean_builder.py",   title="Boolean Search Builder",  icon="🔎")
 interview_prep  = st.Page("pages/interview_prep.py",    title="Interview Prep Pack",     icon="🎤")
 
 # ── Navigation ───────────────────────────────────────────────────────────────
@@ -49,7 +88,8 @@ interview_prep  = st.Page("pages/interview_prep.py",    title="Interview Prep Pa
 pg = st.navigation({
     "":                     [home],
     "Business Development": [bd_outreach, bd_research, market_map],
-    "Delivery":             [cv_screener, cand_outreach, cand_profile, jd_optimizer, interview_prep],
+    "Delivery":             [cv_screener, boolean_builder, cand_outreach, cand_profile,
+                             jd_optimizer, interview_prep],
 })
 
 pg.run()
